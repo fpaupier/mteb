@@ -87,30 +87,19 @@ embedding_gemma_300m = ModelMeta(
 
 
 class EmbeddingGemma2Wrapper(SentenceTransformerEncoderWrapper):
-    """EmbeddingGemma 2 with task prefixes, document titles and native media inputs."""
+    """Preserve document titles and use the checkpoint's public task prompts."""
 
     def __init__(
         self,
         model: str,
         revision: str | None = None,
         *,
-        device: str | None = None,
-        embed_dim: int | None = None,
         config_kwargs: dict[str, Any] | None = None,
         model_prompts: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
         import torch
 
-        if not isinstance(model, str):
-            raise TypeError(
-                "EmbeddingGemma2Wrapper requires a model name or path, "
-                "so loading options can be applied to the model"
-            )
-        if embed_dim is not None and embed_dim not in {128, 256, 512, 768}:
-            raise ValueError(
-                "EmbeddingGemma 2 supports 128, 256, 512 or 768 dimensions"
-            )
         config_kwargs = dict(config_kwargs or {})
         self._modalities = ["text"]
         if config_kwargs.get("vision_config", True) is not None:
@@ -123,14 +112,11 @@ class EmbeddingGemma2Wrapper(SentenceTransformerEncoderWrapper):
             raise ValueError("EmbeddingGemma 2 requires float32 or bfloat16 inference")
         if dtype is None:
             model_kwargs["dtype"] = torch.float32
-        # The model card specifies 1 FPS video and mono 16 kHz audio.
+        # The model card specifies 1 FPS video; the base collator uses 16 kHz audio.
         kwargs.setdefault("fps", None if kwargs.get("num_frames") else 1.0)
-        kwargs.setdefault("target_sampling_rate", 16000)
         super().__init__(
             model,
             revision=revision,
-            device=device,
-            embed_dim=embed_dim,
             config_kwargs=config_kwargs,
             model_kwargs=model_kwargs,
             **kwargs,
@@ -193,23 +179,6 @@ class EmbeddingGemma2Wrapper(SentenceTransformerEncoderWrapper):
         prompt = custom_prompt
         if prompt is None:
             prompt = _resolve_prompt(self.model_prompts, task_metadata, prompt_type)
-        if (
-            custom_prompt is None
-            and prompt_type == PromptType.query
-            and task_metadata.simplified_task_type == "retrieval"
-            and "Programming" in (task_metadata.domains or [])
-        ):
-            prompt = "task: code retrieval | query: "
-        if prompt is None:
-            # Multimodal task types such as ZeroShotClassification have no entry
-            # in the checkpoint's prompt map, but their text still needs a prefix.
-            prompt = {
-                "classification": "task: classification | query: ",
-                "clustering": "task: clustering | query: ",
-                "semantic-similarity": "task: sentence similarity | query: ",
-                "pair-classification": "task: sentence similarity | query: ",
-                "retrieval": "task: search result | query: ",
-            }[task_metadata.simplified_task_type]
         is_document = (
             prompt_type == PromptType.document
             and task_metadata.simplified_task_type == "retrieval"
@@ -229,7 +198,7 @@ class EmbeddingGemma2Wrapper(SentenceTransformerEncoderWrapper):
                         title = batch["title"][index] if "title" in batch else None
                         text = f"title: {title or 'none'} | text: {text}"
                     else:
-                        text = prompt + text
+                        text = (prompt or "") + text
                     # Text comes first when inputs contain multiple modalities.
                     item = {"text": text, **item}
                 prepared.append(item if is_multimodal else item["text"])
@@ -268,7 +237,7 @@ embedding_gemma_2 = ModelMeta(
     release_date="2026-10-06",
     n_parameters=744_371_488,
     n_embedding_parameters=134_217_728,
-    embed_dim=[128, 256, 512, 768],
+    embed_dim=768,
     max_tokens=8192,
     license="apache-2.0",
     reference="https://huggingface.co/google/embeddinggemma-2",

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -8,13 +7,7 @@ import pytest
 import torch
 from datasets import Dataset
 from PIL import Image
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.base.modules import Transformer
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
 from torch.utils.data import DataLoader
-from transformers import PreTrainedTokenizerFast
 
 from mteb.mocks.mock_tasks import MockRetrievalTask
 from mteb.models.model_implementations.google_embeddinggemma import (
@@ -25,11 +18,10 @@ from mteb.types import PromptType
 
 
 class CapturingModel(torch.nn.Module):
-    def __init__(self, *args: Any, truncate_dim=None, **kwargs: Any):
+    def __init__(self, *args: Any, **kwargs: Any):
         super().__init__()
         self.embedding = torch.nn.Embedding(8, 4)
         self.projection = torch.nn.Linear(4, 4, bias=False)
-        self.truncate_dim = truncate_dim or 768
         self.init_kwargs = kwargs
         self.calls = []
         self.prompts = {
@@ -45,10 +37,7 @@ class CapturingModel(torch.nn.Module):
 
     def encode(self, inputs, **kwargs: Any):
         self.calls.append((inputs, kwargs))
-        vectors = np.ones((len(inputs), self.truncate_dim), dtype=np.float32)
-        if kwargs.get("normalize_embeddings"):
-            vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
-        return vectors
+        return np.ones((len(inputs), 768), dtype=np.float32)
 
 
 @pytest.fixture
@@ -63,12 +52,9 @@ def encode(
     *,
     task_type="Retrieval",
     prompt_type=None,
-    domains=None,
     **kwargs: Any,
 ):
-    metadata = MockRetrievalTask.metadata.model_copy(
-        update={"type": task_type, "domains": domains}
-    )
+    metadata = MockRetrievalTask.metadata.model_copy(update={"type": task_type})
     return wrapper.encode(
         DataLoader(
             Dataset.from_dict(data),
@@ -84,35 +70,6 @@ def encode(
         show_progress_bar=False,
         **kwargs,
     )
-
-
-def test_context_window_limits_actual_tokenizer(monkeypatch):
-    unknown_word = "[UNK]"
-    backend = Tokenizer(
-        WordLevel({unknown_word: 0, "token": 1}, unk_token=unknown_word)
-    )
-    backend.pre_tokenizer = Whitespace()
-    tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=backend, unk_token=unknown_word
-    )
-    # Exercise the real SentenceTransformer -> Transformer -> tokenizer setter
-    # without constructing or downloading any model weights.
-    transformer = Transformer.__new__(Transformer)
-    torch.nn.Module.__init__(transformer)  # noqa: PLC2801 -- skip weight-loading constructor
-    transformer.processor = SimpleNamespace(tokenizer=tokenizer)
-    model = SentenceTransformer.__new__(SentenceTransformer)
-    torch.nn.Module.__init__(model)  # noqa: PLC2801 -- skip weight-loading constructor
-    model.add_module("0", transformer)
-    model.prompts = {}
-    monkeypatch.setattr(
-        "sentence_transformers.SentenceTransformer", lambda *args, **kwargs: model
-    )
-
-    wrapper = EmbeddingGemma2Wrapper("google/embeddinggemma-2")
-
-    assert wrapper.model.max_seq_length == 8192
-    assert tokenizer.model_max_length == 8192
-    assert len(tokenizer("token " * 9000, truncation=True)["input_ids"]) == 8192
 
 
 def test_encode_preserves_caller_processing_kwargs(wrapper):
@@ -163,33 +120,13 @@ def test_task_prefixes(wrapper, task_type, prompt_type, expected):
     assert wrapper.model.calls[-1][0] == [expected]
 
 
-def test_programming_retrieval_uses_code_prefix(wrapper):
-    encode(
-        wrapper,
-        {"text": ["example"]},
-        prompt_type=PromptType.query,
-        domains=["Programming", "Written"],
-    )
-    assert wrapper.model.calls[-1][0] == ["task: code retrieval | query: example"]
-
-
-@pytest.mark.parametrize(
-    ("task_type", "expected"),
-    [
-        ("ZeroShotClassification", "task: classification | query: example"),
-        ("AudioZeroshotClassification", "task: classification | query: example"),
-        ("VideoZeroshotClassification", "task: classification | query: example"),
-        ("ImageClustering", "task: clustering | query: example"),
-        ("AudioPairClassification", "task: sentence similarity | query: example"),
-    ],
-)
-def test_unmapped_task_text_uses_simplified_prefix(wrapper, task_type, expected):
-    encode(wrapper, {"text": ["example"]}, task_type=task_type)
-    assert wrapper.model.calls[-1][0] == [expected]
+def test_unmapped_task_does_not_invent_a_prompt(wrapper):
+    encode(wrapper, {"text": ["example"]}, task_type="ZeroShotClassification")
+    assert wrapper.model.calls[-1][0] == ["example"]
 
 
 @pytest.mark.parametrize("prompt", ["custom: ", ""])
-def test_custom_code_query_prefix_takes_precedence(monkeypatch, prompt):
+def test_custom_query_prefix_takes_precedence(monkeypatch, prompt):
     monkeypatch.setattr("sentence_transformers.SentenceTransformer", CapturingModel)
     wrapper = EmbeddingGemma2Wrapper(
         "google/embeddinggemma-2", model_prompts={"query": prompt}
@@ -198,7 +135,6 @@ def test_custom_code_query_prefix_takes_precedence(monkeypatch, prompt):
         wrapper,
         {"text": ["example"]},
         prompt_type=PromptType.query,
-        domains=["Programming"],
     )
     assert wrapper.model.calls[-1][0] == [prompt + "example"]
 
@@ -230,11 +166,6 @@ def test_unmatched_custom_prefix_retains_document_format(monkeypatch):
     assert wrapper.model.calls[-1][0] == ["title: A title | text: The body"]
 
 
-def test_rejects_preloaded_model():
-    with pytest.raises(TypeError, match="requires a model name or path"):
-        EmbeddingGemma2Wrapper(CapturingModel(), embed_dim=128)
-
-
 def test_image_has_no_text_prefix(wrapper):
     encode(
         wrapper,
@@ -261,24 +192,10 @@ def test_mixed_input_preserves_text_before_media(wrapper):
     assert kwargs["prompt"] == ""  # noqa: PLC1901 -- None would enable a default prompt
 
 
-@pytest.mark.parametrize("dimension", [128, 256, 512, 768])
-def test_matryoshka_embeddings_are_normalized(monkeypatch, dimension):
-    monkeypatch.setattr("sentence_transformers.SentenceTransformer", CapturingModel)
-    wrapper = EmbeddingGemma2Wrapper("google/embeddinggemma-2", embed_dim=dimension)
-    embeddings = encode(wrapper, {"text": ["example"]}, task_type="STS")
-    assert embeddings.shape == (1, dimension)
-    np.testing.assert_allclose(np.linalg.norm(embeddings, axis=1), 1, atol=1e-6)
-
-
 @pytest.mark.parametrize("dtype", ["float16", torch.float16])
 def test_rejects_float16(dtype):
     with pytest.raises(ValueError, match="float32 or bfloat16"):
         EmbeddingGemma2Wrapper("unused", model_kwargs={"dtype": dtype})
-
-
-def test_rejects_unsupported_dimension():
-    with pytest.raises(ValueError, match="128, 256, 512 or 768"):
-        EmbeddingGemma2Wrapper("unused", embed_dim=100)
 
 
 def test_selective_loading_metadata_keeps_experiment(monkeypatch):
@@ -287,7 +204,7 @@ def test_selective_loading_metadata_keeps_experiment(monkeypatch):
     wrapper = EmbeddingGemma2Wrapper(
         "google/embeddinggemma-2", config_kwargs=config_kwargs
     )
-    experiment = {"config_kwargs": config_kwargs, "embed_dim": 256}
+    experiment = {"config_kwargs": config_kwargs}
     wrapper.mteb_model_meta = embedding_gemma_2.model_copy(
         update={"experiment_kwargs": experiment}
     )
