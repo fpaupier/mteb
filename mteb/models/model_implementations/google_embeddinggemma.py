@@ -135,6 +135,9 @@ class EmbeddingGemma2Wrapper(SentenceTransformerEncoderWrapper):
             model_kwargs=model_kwargs,
             **kwargs,
         )
+        # The checkpoint does not configure a tokenizer limit. Enforce the
+        # advertised context window for default SentenceTransformers preprocessing.
+        self.model.max_seq_length = 8192
         self._custom_model_prompts = self.validate_task_to_prompt_name(model_prompts)
 
     @property

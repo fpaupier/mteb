@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -7,7 +8,13 @@ import pytest
 import torch
 from datasets import Dataset
 from PIL import Image
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.base.modules import Transformer
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 from torch.utils.data import DataLoader
+from transformers import PreTrainedTokenizerFast
 
 from mteb.mocks.mock_tasks import MockRetrievalTask
 from mteb.models.model_implementations.google_embeddinggemma import (
@@ -50,7 +57,15 @@ def wrapper(monkeypatch):
     return EmbeddingGemma2Wrapper("google/embeddinggemma-2")
 
 
-def encode(wrapper, data, *, task_type="Retrieval", prompt_type=None, domains=None):
+def encode(
+    wrapper,
+    data,
+    *,
+    task_type="Retrieval",
+    prompt_type=None,
+    domains=None,
+    **kwargs: Any,
+):
     metadata = MockRetrievalTask.metadata.model_copy(
         update={"type": task_type, "domains": domains}
     )
@@ -67,7 +82,46 @@ def encode(wrapper, data, *, task_type="Retrieval", prompt_type=None, domains=No
         hf_subset="default",
         prompt_type=prompt_type,
         show_progress_bar=False,
+        **kwargs,
     )
+
+
+def test_context_window_limits_actual_tokenizer(monkeypatch):
+    unknown_word = "[UNK]"
+    backend = Tokenizer(
+        WordLevel({unknown_word: 0, "token": 1}, unk_token=unknown_word)
+    )
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token=unknown_word
+    )
+    # Exercise the real SentenceTransformer -> Transformer -> tokenizer setter
+    # without constructing or downloading any model weights.
+    transformer = Transformer.__new__(Transformer)
+    torch.nn.Module.__init__(transformer)  # noqa: PLC2801 -- skip weight-loading constructor
+    transformer.processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SentenceTransformer.__new__(SentenceTransformer)
+    torch.nn.Module.__init__(model)  # noqa: PLC2801 -- skip weight-loading constructor
+    model.add_module("0", transformer)
+    model.prompts = {}
+    monkeypatch.setattr(
+        "sentence_transformers.SentenceTransformer", lambda *args, **kwargs: model
+    )
+
+    wrapper = EmbeddingGemma2Wrapper("google/embeddinggemma-2")
+
+    assert wrapper.model.max_seq_length == 8192
+    assert tokenizer.model_max_length == 8192
+    assert len(tokenizer("token " * 9000, truncation=True)["input_ids"]) == 8192
+
+
+def test_encode_preserves_caller_processing_kwargs(wrapper):
+    processing_kwargs = {
+        "text": {"max_length": 1024, "truncation": True, "pad_to_multiple_of": 128},
+        "video": {"do_sample_frames": False},
+    }
+    encode(wrapper, {"text": ["example"]}, processing_kwargs=processing_kwargs)
+    assert wrapper.model.calls[-1][1]["processing_kwargs"] == processing_kwargs
 
 
 @pytest.mark.parametrize(
